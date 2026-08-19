@@ -1,0 +1,6 @@
+/mnt/QuinientosM2/github/sfzdrummer/build/CMakeFiles/sfzdrummer.dir
+/mnt/QuinientosM2/github/sfzdrummer/build/CMakeFiles/mini_host.dir
+/mnt/QuinientosM2/github/sfzdrummer/build/CMakeFiles/test_sfz_flatten.dir
+/mnt/QuinientosM2/github/sfzdrummer/build/CMakeFiles/test_preset_file.dir
+/mnt/QuinientosM2/github/sfzdrummer/build/CMakeFiles/edit_cache.dir
+/mnt/QuinientosM2/github/sfzdrummer/build/CMakeFiles/rebuild_cache.dir
