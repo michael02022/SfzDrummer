@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -464,7 +465,7 @@ void drawDrumKitModeControls(SharedParams::DrumItem& d, bool& changed) {
 
 void drawSampleTab(SharedParams& params, EditorUIState& ui,
                    const std::function<void()>& onParamChanged,
-                   const std::function<void()>& onExplodeDrumKit) {
+                   const std::function<void(bool)>& onExplodeDrumKit) {
     bool changed = false;
     bool hasDrum = false;
     bool canExplode = false;
@@ -523,8 +524,13 @@ void drawSampleTab(SharedParams& params, EditorUIState& ui,
             ImGui::TextUnformatted("Each new percussion's root note is taken from its key.");
             ImGui::TextUnformatted(
                 "This replaces this drum's own kit content with key group 1.");
+            ImGui::Checkbox("Add on top of existing percussion (don't replace)",
+                            &ui.explodeKitAddOnTop);
+            ImGui::TextUnformatted(ui.explodeKitAddOnTop
+                                       ? "Every other percussion already in the list is kept."
+                                       : "Any OTHER percussion already in the list is removed first.");
             if (ImGui::Button("Create", ImVec2(140, 0))) {
-                if (onExplodeDrumKit) onExplodeDrumKit();
+                if (onExplodeDrumKit) onExplodeDrumKit(ui.explodeKitAddOnTop);
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
@@ -978,9 +984,167 @@ void drawOpcodesTab(SharedParams& params, const std::function<void()>& onParamCh
     if (changed && onParamChanged) onParamChanged();
 }
 
+// -------------------------------------------------------------- velsw tab
+
+// One layer row: a small name swatch (hover -> tooltip with the sample's
+// filename), a "ceiling" slider (layer.hivel), a delete ("X") button, and -
+// only in crossfade mode, only on a non-last layer - a second "floor"
+// slider (layer.floor) right below it. See shared.hpp's VelSwitchLayer
+// comment for what hivel/floor mean in each mode.
+//
+// Every slider's EFFECTIVE bounds are recomputed from its CURRENT neighbors
+// every frame, and the stored value is clamped into them right before the
+// widget is drawn AND right after a drag changes it - this is what keeps
+// every row always self-consistent no matter how it went stale (a neighbor
+// being edited, a layer being deleted, or the crossfade checkbox's own
+// on/off transition relaxing/re-imposing the whole invariant) without
+// needing separate one-off renormalization code at each of those mutation
+// sites - same neighbor-clamp idea as drawAmpEnvelope's point dragging.
+// The WIDGET itself is always given a fixed 1..126 range regardless of
+// those effective bounds - passing the (narrower, ever-changing) effective
+// bounds straight to ImGui::SliderInt used to make the drag area itself
+// shrink/shift per row, so the same physical handle position meant a
+// different value on every row depending on its neighbors, which read as
+// unintuitive. Fixed 1..126 keeps the handle-position-to-value mapping
+// identical on every row; the clamp is what actually keeps layers from
+// crossing, same as it always did, it just no longer visibly narrows the
+// track.
+void drawVelSwLayerRow(SharedParams::DrumItem& d, size_t i, bool& changed, int& removeIdx) {
+    auto& layers = d.velSwitchLayers;
+    auto& layer = layers[i];
+    const bool isLast = (i + 1 == layers.size());
+    ImGui::PushID(static_cast<int>(i));
+
+    ImGui::Selectable("##name", false, ImGuiSelectableFlags_Disabled, ImVec2(24, 0));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s",
+                          std::filesystem::path(layer.sourcePath).filename().string().c_str());
+    ImGui::SameLine();
+
+    int ceilLo, ceilHi;
+    if (d.velSwCrossfadeEnabled) {
+        int floorAbove = (i == 0) ? d.velSwMainFloor : layers[i - 1].floor;
+        int selfFloorOrOne = isLast ? 1 : layer.floor;
+        ceilLo = std::max(floorAbove, selfFloorOrOne);
+        ceilHi = 126;
+    } else {
+        ceilLo = isLast ? 1 : layers[i + 1].hivel + 1;
+        ceilHi = (i == 0) ? 126 : layers[i - 1].hivel - 1;
+    }
+    if (layer.hivel < ceilLo || layer.hivel > ceilHi) {
+        layer.hivel = std::clamp(layer.hivel, ceilLo, ceilHi);
+        changed = true;
+    }
+    ImGui::SetNextItemWidth(-40);
+    if (ImGui::SliderInt("##ceil", &layer.hivel, 1, 126)) {
+        layer.hivel = std::clamp(layer.hivel, ceilLo, ceilHi);
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("X")) removeIdx = static_cast<int>(i);
+
+    if (d.velSwCrossfadeEnabled && !isLast) {
+        ImGui::Dummy(ImVec2(24, 0));
+        ImGui::SameLine();
+        int floorLo = 1;
+        int floorHi = std::min(layer.hivel, layers[i + 1].hivel);
+        if (layer.floor < floorLo || layer.floor > floorHi) {
+            layer.floor = std::clamp(layer.floor, floorLo, floorHi);
+            changed = true;
+        }
+        ImGui::SetNextItemWidth(-40);
+        if (ImGui::SliderInt("##floor", &layer.floor, 1, 126)) {
+            layer.floor = std::clamp(layer.floor, floorLo, floorHi);
+            changed = true;
+        }
+    }
+
+    ImGui::PopID();
+    // Visually closes off this sample's own slider(s) before the next
+    // layer's row starts - without it, a middle layer's ceiling+floor pair
+    // (2 sliders) runs straight into the next layer's own ceiling with
+    // nothing to show where one sample's controls end and the next one's
+    // begin.
+    ImGui::Separator();
+}
+
+void drawVelSwTab(SharedParams& params, EditorUIState& ui,
+                  const std::function<void()>& onParamChanged,
+                  const std::function<void(const std::string&)>& onVelSwLoadRequested,
+                  const std::function<void(const std::string&)>& onPreviewRequested) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(params.guiState.mutex);
+        SharedParams::DrumItem* d = nullptr;
+        if (params.guiState.selectedId >= 0)
+            for (auto& item : params.guiState.drums)
+                if (item.id == params.guiState.selectedId) {
+                    d = &item;
+                    break;
+                }
+
+        if (!d) {
+            ImGui::TextDisabled("No percussion selected");
+        } else if (d->isSfz) {
+            ImGui::TextDisabled(
+                "VelSW isn't available for a loaded .sfz - only a single sample.");
+        } else if (!d->hasSource) {
+            ImGui::TextDisabled("Load a sample into this percussion first.");
+        } else {
+            if (!d->velSwitchLayers.empty()) {
+                if (ImGui::Checkbox("Enable crossfade between velocities",
+                                    &d->velSwCrossfadeEnabled))
+                    changed = true;
+
+                if (d->velSwCrossfadeEnabled) {
+                    int hi = d->velSwitchLayers.front().hivel;
+                    if (d->velSwMainFloor < 1 || d->velSwMainFloor > hi) {
+                        d->velSwMainFloor = std::clamp(d->velSwMainFloor, 1, hi);
+                        changed = true;
+                    }
+                    ImGui::TextUnformatted("Main sample's own crossfade floor:");
+                    ImGui::SetNextItemWidth(-1);
+                    // Fixed 1..126 widget range, same reasoning as
+                    // drawVelSwLayerRow's own ceiling/floor sliders - only
+                    // the resulting value is clamped to the real bound (hi).
+                    if (ImGui::SliderInt("##mainfloor", &d->velSwMainFloor, 1, 126)) {
+                        d->velSwMainFloor = std::clamp(d->velSwMainFloor, 1, hi);
+                        changed = true;
+                    }
+                    // Separates the main sample's own slider from the
+                    // per-layer rows below it - same reasoning as each
+                    // row's own trailing Separator (drawVelSwLayerRow).
+                    ImGui::Separator();
+                }
+
+                ImGui::TextDisabled("Velocity layers (strongest to weakest, top to bottom):");
+                int removeIdx = -1;
+                for (size_t i = 0; i < d->velSwitchLayers.size(); ++i)
+                    drawVelSwLayerRow(*d, i, changed, removeIdx);
+                if (removeIdx >= 0) {
+                    d->velSwitchLayers.erase(d->velSwitchLayers.begin() + removeIdx);
+                    changed = true;
+                }
+            }
+        }
+    }
+    if (changed && onParamChanged) onParamChanged();
+
+    std::string kitPath;
+    {
+        std::lock_guard<std::mutex> lock(params.guiState.mutex);
+        kitPath = params.guiState.kitPath;
+    }
+    ImGui::TextDisabled("Double-click a sample below to add it as a new (weaker) layer:");
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    ui.velSwFileExplorer.draw(avail, kitPath, onPreviewRequested, onVelSwLoadRequested);
+}
+
 void drawEditZone(SharedParams& params, EditorUIState& ui,
                   const std::function<void()>& onParamChanged,
-                  const std::function<void()>& onExplodeDrumKit) {
+                  const std::function<void(const std::string&)>& onVelSwLoadRequested,
+                  const std::function<void(const std::string&)>& onPreviewRequested,
+                  const std::function<void(bool)>& onExplodeDrumKit) {
     std::string selLabel;
     bool hasSel;
     {
@@ -1026,6 +1190,10 @@ void drawEditZone(SharedParams& params, EditorUIState& ui,
         }
         if (ImGui::BeginTabItem("Opcodes", nullptr, tabFlags("Opcodes"))) {
             drawOpcodesTab(params, onParamChanged);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("VelSW", nullptr, tabFlags("VelSW"))) {
+            drawVelSwTab(params, ui, onParamChanged, onVelSwLoadRequested, onPreviewRequested);
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -1090,12 +1258,16 @@ void drawErrorToast(SharedParams& params) {
 void drawEditorUI(SharedParams& params, EditorUIState& ui,
                   const std::function<void()>& onParamChanged,
                   const std::function<void(const std::string&)>& onLoadRequested,
+                  const std::function<void(const std::string&)>& onVelSwLoadRequested,
                   const std::function<void(const std::string&)>& onPreviewRequested,
                   const std::function<void()>& onSavePreset,
                   const std::function<void()>& onLoadPreset,
                   const std::function<void()>& onSaveProfile,
                   const std::function<void()>& onLoadProfile,
-                  const std::function<void()>& onExplodeDrumKit,
+                  const std::function<void()>& onSavePerc,
+                  const std::function<void()>& onLoadPerc,
+                  const std::function<void()>& onSetKitPath,
+                  const std::function<void(bool)>& onExplodeDrumKit,
                   const std::function<void()>& onInitKit) {
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
@@ -1193,6 +1365,32 @@ void drawEditorUI(SharedParams& params, EditorUIState& ui,
             if (onParamChanged) onParamChanged();
         }
     }
+
+    // Perc row - "Save Perc"/"Load Perc" save/restore ONE drum's full
+    // identity+design (unlike Save/Load Profile, design-only) in its own
+    // .drmperc file, portable across kits. Kit Path lets that identity's
+    // sample/sfz source survive a reinstall/library move - see shared.hpp's
+    // GuiState::kitPath comment. Own row: the Preset/Profile/Init Kit row
+    // above is already full-width at the default window size.
+    if (ImGui::Button("Save Perc") && onSavePerc) onSavePerc();
+    ImGui::SameLine();
+    if (ImGui::Button("Load Perc") && onLoadPerc) onLoadPerc();
+    ImGui::SameLine();
+    if (ImGui::Button("Set Kit Folder...") && onSetKitPath) onSetKitPath();
+    ImGui::SameLine();
+    {
+        std::lock_guard<std::mutex> lock(params.guiState.mutex);
+        const std::string& kp = params.guiState.kitPath;
+        // Truncated to the tail (the part that actually distinguishes one
+        // configured folder from another) - full path always in the
+        // tooltip.
+        constexpr size_t kMaxShown = 40;
+        std::string shown = kp.empty()               ? "(not set)"
+                            : kp.size() <= kMaxShown ? kp
+                                                     : "..." + kp.substr(kp.size() - kMaxShown);
+        ImGui::TextDisabled("%s", shown.c_str());
+        if (!kp.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kp.c_str());
+    }
     ImGui::Separator();
 
     // Debug-only, opt-in: SFZDRUMMER_DEBUG_SELECT=<label> force-selects that
@@ -1250,6 +1448,21 @@ void drawEditorUI(SharedParams& params, EditorUIState& ui,
             if (getenv("SFZDRUMMER_DEBUG_LOAD_PRESET_PATH") && onLoadPreset) onLoadPreset();
             if (getenv("SFZDRUMMER_DEBUG_SAVE_PROFILE_PATH") && onSaveProfile) onSaveProfile();
             if (getenv("SFZDRUMMER_DEBUG_LOAD_PROFILE_PATH") && onLoadProfile) onLoadProfile();
+            if (getenv("SFZDRUMMER_DEBUG_SAVE_PERC_PATH") && onSavePerc) onSavePerc();
+            if (getenv("SFZDRUMMER_DEBUG_LOAD_PERC_PATH") && onLoadPerc) onLoadPerc();
+        }
+    }
+
+    // Debug-only, opt-in: SFZDRUMMER_DEBUG_SET_KIT_PATH=<dir> fires
+    // onSetKitPath once on the first frame, bypassing the "Set Kit
+    // Folder..." button - plugin.cpp's handleSetKitPath checks this SAME
+    // env var again to bypass zenity and use that literal folder directly.
+    // Same convention as the SAVE/LOAD_*_PATH hooks above.
+    {
+        static bool debugKitPathDone = false;
+        if (!debugKitPathDone) {
+            debugKitPathDone = true;
+            if (getenv("SFZDRUMMER_DEBUG_SET_KIT_PATH") && onSetKitPath) onSetKitPath();
         }
     }
 
@@ -1262,7 +1475,7 @@ void drawEditorUI(SharedParams& params, EditorUIState& ui,
         static bool debugExplodeDone = false;
         if (!debugExplodeDone) {
             debugExplodeDone = true;
-            if (getenv("SFZDRUMMER_DEBUG_EXPLODE_KIT") && onExplodeDrumKit) onExplodeDrumKit();
+            if (getenv("SFZDRUMMER_DEBUG_EXPLODE_KIT") && onExplodeDrumKit) onExplodeDrumKit(false);
         }
     }
 
@@ -1310,15 +1523,21 @@ void drawEditorUI(SharedParams& params, EditorUIState& ui,
         // Load/preview failures show as a temporary corner toast (see
         // drawErrorToast) instead of inline here - this column is too
         // narrow for an error message to read comfortably.
+        std::string kitPath;
+        {
+            std::lock_guard<std::mutex> lock(params.guiState.mutex);
+            kitPath = params.guiState.kitPath;
+        }
         ImVec2 avail = ImGui::GetContentRegionAvail();
-        ui.fileExplorer.draw(avail, onPreviewRequested, onLoadRequested);
+        ui.fileExplorer.draw(avail, kitPath, onPreviewRequested, onLoadRequested);
     }
     ImGui::EndChild();
 
     ImGui::SameLine();
 
     ImGui::BeginChild("##editcol", ImVec2(editWidth, bodyHeight), true);
-    drawEditZone(params, ui, onParamChanged, onExplodeDrumKit);
+    drawEditZone(params, ui, onParamChanged, onVelSwLoadRequested, onPreviewRequested,
+                onExplodeDrumKit);
     ImGui::EndChild();
 
     ImGui::Spacing();

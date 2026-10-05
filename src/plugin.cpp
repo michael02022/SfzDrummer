@@ -12,9 +12,11 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -63,6 +65,27 @@ void setListError(SharedParams::GuiState& gs, std::string message) {
 // stripped, not a path relative to some other fake root.
 std::string sampleRelativePath(const std::string& absPath) {
     return (!absPath.empty() && absPath.front() == '/') ? absPath.substr(1) : absPath;
+}
+
+// Kit Path (see shared.hpp's GuiState::kitPath) - true iff absPath is
+// (canonically) inside kitPath, with subPath set to the portable,
+// kitPath-relative remainder. Used by both loadIntoSelectedDrum and
+// addVelSwitchLayer so kit-relative tracking works no matter which file
+// explorer instance/tab/folder the user actually navigated through to get
+// there - per spec this is pure path containment, not tied to whichever
+// tab was clicked.
+bool resolveKitRelative(const std::string& kitPath, const std::string& absPath,
+                        std::string& subPath) {
+    if (kitPath.empty()) return false;
+    std::error_code ec;
+    std::filesystem::path kit = std::filesystem::weakly_canonical(kitPath, ec);
+    if (ec) return false;
+    std::filesystem::path file = std::filesystem::weakly_canonical(absPath, ec);
+    if (ec) return false;
+    std::filesystem::path rel = file.lexically_relative(kit);
+    if (rel.empty() || rel.native().rfind("..", 0) == 0) return false;
+    subPath = rel.generic_string();
+    return true;
 }
 
 // Same note-naming as editor_ui.cpp's own noteName (duplicated rather than
@@ -168,6 +191,17 @@ bool loadIntoSelectedDrum(Plugin* p, const std::string& path) {
                 d.hasSource = true;
                 d.isSfz = isSfz;
                 d.sourcePath = path;
+                // Kit Path auto-detection (see shared.hpp's GuiState::
+                // kitPath) - path-based, regardless of which file explorer
+                // tab/folder the user actually navigated through.
+                std::string kitSubPath;
+                if (resolveKitRelative(gs.kitPath, path, kitSubPath)) {
+                    d.sourceIsKitRelative = true;
+                    d.kitRelativeSubPath = kitSubPath;
+                } else {
+                    d.sourceIsKitRelative = false;
+                    d.kitRelativeSubPath.clear();
+                }
                 // A new source invalidates any previous Drum Kit Mode pick -
                 // it referred to the OLD file's key layout.
                 d.drumKitModeEnabled = false;
@@ -189,8 +223,204 @@ bool loadIntoSelectedDrum(Plugin* p, const std::string& path) {
             if (applied) gs.listError.clear();
         }
     }
+    if (applied) {
+        // One-way VelSW mini-explorer sync (main -> VelSW only, never the
+        // reverse, per spec) - covers both callers of this function (a
+        // main-explorer double click and an XDND drop) for free, since the
+        // VelSW mini explorer otherwise has no reason to ever be sitting in
+        // the same folder the main one just navigated to/through.
+        // Deliberately does NOT touch d.velSwitchLayers/
+        // velSwCrossfadeEnabled/velSwMainFloor - a source swap (sample or
+        // SFZ) never clears VelSW state, see shared.hpp's VelSwitchLayer
+        // comment.
+        p->uiState.velSwFileExplorer.jumpTo(
+            std::filesystem::path(path).parent_path().string());
+        regenerateAndLoadDrumSfz(p);
+    }
+    return applied;
+}
+
+// VelSW tab's own mini file explorer double-click (editor_ui.cpp's
+// drawVelSwTab) - adds `path` as a new layer, weaker than every layer
+// already on the selected drum (shared.hpp's DrumItem::velSwitchLayers).
+// Sample-only (the mini explorer never loads a kit, per spec) and only
+// usable while the selected drum's own main source is a plain sample (the
+// VelSW tab is otherwise just informational, see drawVelSwTab) - both
+// rejected via the same listError toast loadIntoSelectedDrum's own guards
+// use. GUI thread only, same convention as loadIntoSelectedDrum.
+bool addVelSwitchLayer(Plugin* p, const std::string& path) {
+    if (!isSupportedAudioFile(path)) {
+        std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+        setListError(p->params.guiState, "VelSW only accepts samples, not .sfz files: " + path);
+        return false;
+    }
+
+    bool applied = false;
+    {
+        std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+        auto& gs = p->params.guiState;
+        SharedParams::DrumItem* d = nullptr;
+        for (auto& item : gs.drums)
+            if (item.id == gs.selectedId) {
+                d = &item;
+                break;
+            }
+
+        if (!d) {
+            setListError(gs, "Select a percussion first");
+        } else if (!d->hasSource || d->isSfz) {
+            setListError(gs, "Load a plain sample (not an SFZ) into this percussion first.");
+        } else {
+            int upperBound =
+                d->velSwitchLayers.empty() ? 126 : d->velSwitchLayers.back().hivel - 1;
+            if (upperBound < 1) {
+                setListError(gs, "No more velocity range left for another VelSW layer.");
+            } else {
+                VelSwitchLayer layer;
+                layer.sourcePath = path;
+                layer.sampleRelativePath = sampleRelativePath(path);
+                layer.hivel = std::max(1, upperBound / 2);
+                layer.floor = layer.hivel; // zero-width crossfade until dragged - always valid
+                // Kit Path auto-detection, same as loadIntoSelectedDrum.
+                std::string kitSubPath;
+                if (resolveKitRelative(gs.kitPath, path, kitSubPath)) {
+                    layer.isKitRelative = true;
+                    layer.kitRelativeSubPath = kitSubPath;
+                }
+                d->velSwitchLayers.push_back(std::move(layer));
+                gs.listError.clear();
+                applied = true;
+            }
+        }
+    }
     if (applied) regenerateAndLoadDrumSfz(p);
     return applied;
+}
+
+// Sample-format-transition recovery (independent of Kit Path): given a
+// candidate absolute path, returns it unchanged if it exists, else tries
+// swapping its extension for ".flac" (same folder/base name) and returns
+// THAT instead if it exists - lets a saved kit/perc/project keep working
+// after the user converts their sample library to FLAC to save space
+// ("estoy en transicion"), without needing to resave anything. Falls back
+// to the original (unresolved) candidate if neither exists, same
+// best-effort philosophy as the rest of this reresolve pipeline.
+std::string resolveExistingSampleFile(const std::string& candidatePath) {
+    if (candidatePath.empty()) return candidatePath;
+    std::error_code ec;
+    if (std::filesystem::exists(candidatePath, ec)) return candidatePath;
+    std::filesystem::path flac = std::filesystem::path(candidatePath).replace_extension(".flac");
+    if (std::filesystem::exists(flac, ec)) return flac.string();
+    return candidatePath;
+}
+
+// Rewrites every "sample=<value>\n" line in `regionsText` (SfzFlatten.cpp's
+// own output convention - always root("/")-relative, one opcode per line,
+// same convention DrumSfzBuilder.cpp's stripKeyOpcodes already relies on)
+// whose referenced file is missing on disk to its ".flac" sibling instead,
+// via resolveExistingSampleFile above - the isSfz counterpart to a plain-
+// sample drum's own source getting the same treatment below (an .sfz kit's
+// individual samples can be converted to FLAC same as any other). Regions
+// whose sample already exists, or whose neither variant exists, are left
+// untouched.
+std::string patchMissingSamplesToFlac(const std::string& regionsText) {
+    static constexpr const char* kPrefix = "sample=";
+    const size_t prefixLen = strlen(kPrefix);
+    std::istringstream in(regionsText);
+    std::ostringstream out;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.compare(0, prefixLen, kPrefix) == 0) {
+            std::string abs = "/" + line.substr(prefixLen);
+            std::string resolved = resolveExistingSampleFile(abs);
+            if (resolved != abs) {
+                out << kPrefix << sampleRelativePath(resolved) << "\n";
+                continue;
+            }
+        }
+        out << line << "\n";
+    }
+    return out.str();
+}
+
+// Re-resolves every drum's source (and each of its VelSW layers) that
+// might be stale after a load - either because it's kit-relative
+// (shared.hpp's DrumItem::sourceIsKitRelative/VelSwitchLayer::
+// isKitRelative) and Kit Path has since changed, or because the
+// referenced file was converted to a different format (currently just
+// .flac, see resolveExistingSampleFile) - independent concerns that can
+// both apply to the same file at once, so handled together in one pass.
+// Refreshes sourcePath/sampleRelativePath (and, for an isSfz drum,
+// re-flattens regionsText/drumKitGroups fresh via the same
+// flattenMultisampleSfz/flattenDrumKit calls loadIntoSelectedDrum makes for
+// a brand-new .sfz load, THEN patches any individual sample= references
+// still missing inside that text). Called right after Kit Path itself
+// changes (handleSetKitPath) and right after loading anything that might
+// have been saved on a DIFFERENT machine/session or before a format
+// conversion (CLAP state/.drmpreset/.drmperc) - deliberately NOT something
+// DrumSfzBuilder.cpp redoes on every regenerate, since that would mean
+// re-parsing a whole .sfz (or stat()-ing every sample) on every slider
+// tick. Best-effort per source: whatever doesn't resolve keeps its
+// existing (stale but still valid) snapshot rather than erroring or
+// blanking the drum out. GUI thread only, same convention as
+// loadIntoSelectedDrum.
+void reresolveStaleSources(Plugin* p) {
+    std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+    auto& gs = p->params.guiState;
+    for (auto& d : gs.drums) {
+        if (d.hasSource) {
+            std::string candidate =
+                (d.sourceIsKitRelative && !gs.kitPath.empty())
+                    ? (std::filesystem::path(gs.kitPath) / d.kitRelativeSubPath).string()
+                    : d.sourcePath;
+            std::string resolved = resolveExistingSampleFile(candidate);
+            std::error_code ec;
+            if (std::filesystem::exists(resolved, ec)) {
+                d.sourcePath = resolved;
+                if (d.sourceIsKitRelative && !gs.kitPath.empty()) {
+                    std::string sub;
+                    if (resolveKitRelative(gs.kitPath, resolved, sub)) d.kitRelativeSubPath = sub;
+                }
+                if (d.isSfz) {
+                    FlattenedSfz flat = flattenMultisampleSfz(resolved);
+                    if (flat.ok) {
+                        d.regionsText = flat.regionsText;
+                        d.regionCount = flat.regionCount;
+                    }
+                    FlattenedDrumKit kit = flattenDrumKit(resolved);
+                    if (kit.ok) d.drumKitGroups = std::move(kit.keyGroups);
+                } else {
+                    d.sampleRelativePath = sampleRelativePath(resolved);
+                }
+            }
+            if (d.isSfz) {
+                // Whether or not the .sfz file itself just got re-flattened
+                // above, its regions might still reference individual
+                // sample files that only need the .flac fallback - patch
+                // those in place.
+                d.regionsText = patchMissingSamplesToFlac(d.regionsText);
+                for (auto& group : d.drumKitGroups)
+                    group.regionsText = patchMissingSamplesToFlac(group.regionsText);
+            }
+        }
+        for (auto& layer : d.velSwitchLayers) {
+            std::string candidate =
+                (layer.isKitRelative && !gs.kitPath.empty())
+                    ? (std::filesystem::path(gs.kitPath) / layer.kitRelativeSubPath).string()
+                    : layer.sourcePath;
+            std::string resolved = resolveExistingSampleFile(candidate);
+            std::error_code ec;
+            if (std::filesystem::exists(resolved, ec)) {
+                layer.sourcePath = resolved;
+                layer.sampleRelativePath = sampleRelativePath(resolved);
+                if (layer.isKitRelative && !gs.kitPath.empty()) {
+                    std::string sub;
+                    if (resolveKitRelative(gs.kitPath, resolved, sub))
+                        layer.kitRelativeSubPath = sub;
+                }
+            }
+        }
+    }
 }
 
 // "Load regions as individual percussion" (Sample tab, confirmed via
@@ -212,9 +442,26 @@ bool loadIntoSelectedDrum(Plugin* p, const std::string& path) {
 // gets a note-name label so the resulting list is immediately readable
 // without cross-checking each rootNote by hand.
 //
+// Every resulting drum KEEPS Drum Kit Mode on and the full drumKitGroups
+// list (not just its own key) - that's the point of exploding a whole
+// kit rather than picking keys one at a time: each pad stays able to
+// re-pick any OTHER key from the same source .sfz later via the Sample
+// tab's slider, it just starts out on the key it was created from
+// (drumKitGroupIndex == its own position in `groups`).
+//
+// This REPLACES the whole kit, not just the selected drum, by default:
+// every other drum already in the list is dropped before the new key
+// groups are appended, so exploding a different .sfz here (e.g.
+// re-running this on a drum that was itself group 0 of a PREVIOUS
+// explode) can't leave that previous kit's pads sitting alongside the
+// new ones. addOnTop opts back into the old "just add alongside" shape
+// for the exceptional case of deliberately layering a second kit's pads
+// onto the first (see editor_ui.cpp's "Add on top of existing
+// percussion" checkbox in the confirmation modal).
+//
 // GUI thread only, same convention as loadIntoSelectedDrum. Returns true
 // iff the explode actually happened.
-bool explodeSelectedDrumKit(Plugin* p) {
+bool explodeSelectedDrumKit(Plugin* p, bool addOnTop) {
     std::vector<DrumKitKeyGroup> groups;
     int selId = -1;
     {
@@ -261,9 +508,18 @@ bool explodeSelectedDrumKit(Plugin* p) {
         d->label = noteName(groups[0].key);
         d->regionsText = groups[0].regionsText;
         d->regionCount = groups[0].regionCount;
-        d->drumKitModeEnabled = false;
+        d->drumKitModeEnabled = true;
         d->drumKitGroupIndex = 0;
-        d->drumKitGroups.clear();
+        d->drumKitGroups = groups;
+
+        // Drop every OTHER drum before appending the rest of this kit's
+        // groups - see the function comment above for why (this replaces
+        // the kit by default; addOnTop skips this to keep them instead).
+        if (!addOnTop) {
+            SharedParams::DrumItem kept = std::move(*d);
+            gs.drums.clear();
+            gs.drums.push_back(std::move(kept));
+        }
 
         for (size_t i = 1; i < groups.size(); ++i) {
             SharedParams::DrumItem nd;
@@ -276,8 +532,12 @@ bool explodeSelectedDrumKit(Plugin* p) {
             nd.sourcePath = sourcePath;
             nd.regionsText = groups[i].regionsText;
             nd.regionCount = groups[i].regionCount;
+            nd.drumKitModeEnabled = true;
+            nd.drumKitGroupIndex = static_cast<int>(i);
+            nd.drumKitGroups = groups;
             gs.drums.push_back(std::move(nd));
         }
+        gs.selectedId = selId;
         gs.listError.clear();
     }
     regenerateAndLoadDrumSfz(p);
@@ -329,15 +589,40 @@ std::string presetsDir() {
     return (home ? std::string(home) : std::string(".")) + "/SfzdrummerPresets";
 }
 
-// Save Profile's default filename: the selected drum's own label (so
-// saving "Kick"'s design proposes "Kick.drmprofile") - falls back to
-// "Untitled" if somehow nothing is selected (handleSaveProfile already
-// refuses to even open the dialog in that case, see below - this is just
-// a safe fallback, never actually exercised through the button). Save
-// Preset has no equivalent single "current name" to derive from (a preset
-// is the WHOLE kit, not any one drum) - always "Untitled" there, matching
-// SoloSampler's own stack-empty fallback.
-std::string defaultProfileBaseName(Plugin* p) {
+// Kit Path's own persistence (see shared.hpp's GuiState::kitPath) - a
+// single dotfile directly in $HOME, same flat/simple style as presetsDir()
+// above, deliberately NOT inside presetsDir() itself (that directory is
+// specifically "saved kit files", a preference doesn't belong in it) and
+// deliberately NOT part of any CLAP state/.drmpreset/.drmperc (see the
+// field's own comment for why: it must resolve against whatever THIS
+// machine has configured, not travel with a project file).
+std::string kitPathConfigFile() {
+    const char* home = getenv("HOME");
+    return (home ? std::string(home) : std::string(".")) + "/.sfzdrummer_kitpath";
+}
+
+std::string loadKitPathFromConfig() {
+    std::ifstream f(kitPathConfigFile());
+    std::string line;
+    if (f && std::getline(f, line)) return line;
+    return "";
+}
+
+void saveKitPathToConfig(const std::string& path) {
+    std::ofstream f(kitPathConfigFile(), std::ios::trunc);
+    if (f) f << path;
+}
+
+// Save Profile/Save Perc's default filename: the selected drum's own label
+// (so saving "Kick"'s design proposes "Kick.drmprofile"/"Kick.drmperc") -
+// falls back to "Untitled" if somehow nothing is selected
+// (handleSaveProfile/handleSavePerc already refuse to even open the
+// dialog in that case, see below - this is just a safe fallback, never
+// actually exercised through either button). Save Preset has no
+// equivalent single "current name" to derive from (a preset is the WHOLE
+// kit, not any one drum) - always "Untitled" there, matching SoloSampler's
+// own stack-empty fallback.
+std::string defaultSelectedDrumBaseName(Plugin* p) {
     std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
     for (auto& d : p->params.guiState.drums)
         if (d.id == p->params.guiState.selectedId) return d.label.empty() ? "Untitled" : d.label;
@@ -383,6 +668,11 @@ bool loadPresetFromPath(Plugin* p, const std::string& path) {
         p->params.guiState.selectedId = -1;
         p->params.guiState.listError.clear();
     }
+    // Kit Path isn't part of .drmpreset (see shared.hpp's GuiState::
+    // kitPath) - re-resolve every kit-relative source against whatever
+    // THIS machine currently has configured, in case this preset was saved
+    // elsewhere.
+    reresolveStaleSources(p);
     regenerateAndLoadDrumSfz(p);
     return true;
 }
@@ -493,7 +783,8 @@ void handleSaveProfile(Plugin* p) {
         }
     }
     std::filesystem::create_directories(presetsDir());
-    const std::string defaultPath = presetsDir() + "/" + defaultProfileBaseName(p) + ".drmprofile";
+    const std::string defaultPath =
+        presetsDir() + "/" + defaultSelectedDrumBaseName(p) + ".drmprofile";
     std::string path =
         zenitySaveFile("Save Profile", defaultPath, {{"SfzDrummer Profile", "*.drmprofile"}});
     if (path.empty()) return;
@@ -519,6 +810,124 @@ void handleLoadProfile(Plugin* p) {
                                       {{"SfzDrummer Profile", "*.drmprofile"}});
     if (path.empty()) return;
     loadProfileFromPath(p, path);
+}
+
+// Save Perc/Load Perc - unlike Save/Load Profile (design-only), a .drmperc
+// carries a drum's FULL identity (label/note/output/source/VelSW layers)
+// AND design together, portable across kits - see PresetFile.h's
+// writeDrumPerc/readDrumPerc (literally one .drmpreset entry's own
+// writeDrumIdentity+writeDrumDesign, with its own file header). GUI thread
+// only, same convention as savePresetToPath/loadPresetFromPath.
+bool savePercToPath(Plugin* p, const std::string& path) {
+    SharedParams::DrumItem copy;
+    {
+        std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+        auto& gs = p->params.guiState;
+        SharedParams::DrumItem* d = nullptr;
+        for (auto& item : gs.drums)
+            if (item.id == gs.selectedId) {
+                d = &item;
+                break;
+            }
+        if (!d) {
+            setListError(gs, "Select a percussion first");
+            return false;
+        }
+        copy = *d;
+    }
+    bool ok = writeDrumPerc(path, copy);
+    std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+    if (ok) p->params.guiState.listError.clear();
+    else setListError(p->params.guiState, "Could not save: " + path);
+    return ok;
+}
+
+// Confirmed behavior: Load Perc always APPENDS a new drum (never
+// overwrites the current selection, unlike Load Profile) - a saved
+// percussion is a standalone unit meant to be dropped into any kit, not a
+// design merged onto something already there. Re-resolves Kit Path (in
+// case this .drmperc was saved on a different machine) before generating,
+// same as stateLoad/loadPresetFromPath.
+bool loadPercFromPath(Plugin* p, const std::string& path) {
+    DrumPercResult result = readDrumPerc(path);
+    if (!result.ok) {
+        std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+        setListError(p->params.guiState, result.error);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+        auto& gs = p->params.guiState;
+        result.drum.id = gs.nextId++;
+        gs.drums.push_back(std::move(result.drum));
+        gs.selectedId = gs.drums.back().id;
+        gs.listError.clear();
+    }
+    reresolveStaleSources(p);
+    regenerateAndLoadDrumSfz(p);
+    return true;
+}
+
+void handleSavePerc(Plugin* p) {
+    if (const char* debugPath = getenv("SFZDRUMMER_DEBUG_SAVE_PERC_PATH")) {
+        savePercToPath(p, debugPath);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+        if (p->params.guiState.selectedId < 0) {
+            setListError(p->params.guiState, "Select a percussion first");
+            return;
+        }
+    }
+    std::filesystem::create_directories(presetsDir());
+    const std::string defaultPath =
+        presetsDir() + "/" + defaultSelectedDrumBaseName(p) + ".drmperc";
+    std::string path = zenitySaveFile("Save Perc", defaultPath, {{"SfzDrummer Perc", "*.drmperc"}});
+    if (path.empty()) return;
+    const std::string ext = ".drmperc";
+    if (path.size() < ext.size() || path.compare(path.size() - ext.size(), ext.size(), ext) != 0)
+        path += ext;
+    savePercToPath(p, path);
+}
+
+void handleLoadPerc(Plugin* p) {
+    if (const char* debugPath = getenv("SFZDRUMMER_DEBUG_LOAD_PERC_PATH")) {
+        loadPercFromPath(p, debugPath);
+        return;
+    }
+    std::string path =
+        zenityOpenFile("Load Perc", presetsDir() + "/", {{"SfzDrummer Perc", "*.drmperc"}});
+    if (path.empty()) return;
+    loadPercFromPath(p, path);
+}
+
+// "Set Kit Folder..." persistent-row button handler - opens a folder
+// picker, persists the choice globally (see shared.hpp's GuiState::
+// kitPath/kitPathConfigFile above), then refreshes every already-loaded
+// kit-relative source against it (same effect as reopening a project after
+// a reinstall, but immediate/in-session). GUI thread only.
+void handleSetKitPath(Plugin* p) {
+    std::string path;
+    if (const char* debugPath = getenv("SFZDRUMMER_DEBUG_SET_KIT_PATH")) {
+        path = debugPath;
+    } else {
+        std::string current;
+        {
+            std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+            current = p->params.guiState.kitPath;
+        }
+        path = zenitySelectFolder("Set Kit Folder", current.empty() ? presetsDir() : current);
+    }
+    if (path.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+        p->params.guiState.kitPath = path;
+    }
+    saveKitPathToConfig(path);
+    reresolveStaleSources(p);
+    regenerateAndLoadDrumSfz(p);
 }
 
 Plugin* self(const clap_plugin_t* p) { return static_cast<Plugin*>(p->plugin_data); }
@@ -630,7 +1039,7 @@ const clap_plugin_note_name_t kExtNoteName = {
 // persisting so far (see kStateVersion's per-version comment above).
 
 constexpr uint32_t kStateMagic = 0x44465A53; // "SZFD" LE bytes
-constexpr uint32_t kStateVersion = 14; // v3: Sample tab (volume/pan/width/quality/polyphony/
+constexpr uint32_t kStateVersion = 17; // v3: Sample tab (volume/pan/width/quality/polyphony/
                                       // notePolyphony/disableNoteSelfmask/loopModeIndex/reverse/
                                       // offset/vel2offset/exclusiveClass/group/offbyEnabled/
                                       // offby/transpose/tune)
@@ -659,6 +1068,23 @@ constexpr uint32_t kStateVersion = 14; // v3: Sample tab (volume/pan/width/quali
                                       // v14: whole-instrument bendUpCents/bendDownCents (Bend
                                       // Range combobox, NOT per-drum - written once, right
                                       // after mpeEnabled)
+                                      // v15: VelSW tab (per-drum velSwitchLayers - velocity-
+                                      // switch layers - plus velSwCrossfadeEnabled/
+                                      // velSwMainFloor)
+                                      // v16: Kit Path (per-drum sourceIsKitRelative/
+                                      // kitRelativeSubPath, plus the same pair added to
+                                      // each v15 VelSwitchLayer entry - NOT the kit path
+                                      // itself, which is a global user preference, never
+                                      // part of this format, see shared.hpp's GuiState::
+                                      // kitPath)
+                                      // v17: whole-instrument selectedIndex (which drum
+                                      // row was selected, by position - NOT selectedId
+                                      // itself, since ids get renumbered on every load
+                                      // below - written once, right after
+                                      // bendDownCents). A v16 stream (missing this field)
+                                      // is still accepted; loading one just falls back to
+                                      // selecting the first drum instead of none, see
+                                      // stateLoad.
 
 bool streamWriteAll(const clap_ostream_t* stream, const void* data, uint64_t size) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -705,9 +1131,15 @@ bool readString(const clap_istream_t* s, std::string& out) {
 bool stateSave(const clap_plugin_t* plugin, const clap_ostream_t* stream) {
     Plugin* p = self(plugin);
     std::vector<SharedParams::DrumItem> drums;
+    int32_t selectedIndex = -1;
     {
         std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
         drums = p->params.guiState.drums;
+        for (size_t i = 0; i < drums.size(); ++i)
+            if (drums[i].id == p->params.guiState.selectedId) {
+                selectedIndex = static_cast<int32_t>(i);
+                break;
+            }
     }
 
     bool ok = writeVal(stream, kStateMagic) && writeVal(stream, kStateVersion) &&
@@ -826,6 +1258,25 @@ bool stateSave(const clap_plugin_t* plugin, const clap_ostream_t* stream) {
         // v12: Opcodes tab.
         if (!ok) break;
         ok = writeString(stream, d.customOpcodesText);
+        // v15: VelSW tab. v16 added isKitRelative/kitRelativeSubPath to
+        // each layer entry's own shape below.
+        if (!ok) break;
+        ok = writeVal(stream, static_cast<uint8_t>(d.velSwCrossfadeEnabled ? 1 : 0)) &&
+             writeVal(stream, static_cast<int32_t>(d.velSwMainFloor)) &&
+             writeVal(stream, static_cast<uint32_t>(d.velSwitchLayers.size()));
+        for (const auto& layer : d.velSwitchLayers) {
+            if (!ok) break;
+            ok = writeString(stream, layer.sourcePath) &&
+                 writeString(stream, layer.sampleRelativePath) &&
+                 writeVal(stream, static_cast<int32_t>(layer.hivel)) &&
+                 writeVal(stream, static_cast<int32_t>(layer.floor)) &&
+                 writeVal(stream, static_cast<uint8_t>(layer.isKitRelative ? 1 : 0)) &&
+                 writeString(stream, layer.kitRelativeSubPath);
+        }
+        // v16: Kit Path (drum's own main source).
+        if (!ok) break;
+        ok = writeVal(stream, static_cast<uint8_t>(d.sourceIsKitRelative ? 1 : 0)) &&
+             writeString(stream, d.kitRelativeSubPath);
     }
     // v13: whole-instrument mpeEnabled (NOT per-drum - written once, here,
     // after the drum list).
@@ -834,6 +1285,8 @@ bool stateSave(const clap_plugin_t* plugin, const clap_ostream_t* stream) {
     if (ok)
         ok = writeVal(stream, static_cast<int32_t>(p->params.bendUpCents.load())) &&
              writeVal(stream, static_cast<int32_t>(p->params.bendDownCents.load()));
+    // v17: whole-instrument selectedIndex (NOT per-drum).
+    if (ok) ok = writeVal(stream, selectedIndex);
     return ok;
 }
 
@@ -842,7 +1295,10 @@ bool stateLoad(const clap_plugin_t* plugin, const clap_istream_t* stream) {
 
     uint32_t magic = 0, version = 0, count = 0;
     if (!readVal(stream, magic) || magic != kStateMagic) return false;
-    if (!readVal(stream, version) || version != kStateVersion) return false;
+    // v16 (no selectedIndex field yet) is still accepted for backward
+    // compatibility with projects saved before v17 - see stateLoad's
+    // selectedIndex handling below.
+    if (!readVal(stream, version) || (version != 16 && version != kStateVersion)) return false;
     if (!readVal(stream, count)) return false;
 
     std::vector<SharedParams::DrumItem> drums;
@@ -1045,6 +1501,38 @@ bool stateLoad(const clap_plugin_t* plugin, const clap_istream_t* stream) {
         // v12: Opcodes tab.
         if (!readString(stream, d.customOpcodesText)) return false;
 
+        // v15: VelSW tab. v16 added isKitRelative/kitRelativeSubPath to
+        // each layer entry's own shape below.
+        uint8_t velSwCrossfadeEnabled = 0;
+        int32_t velSwMainFloor = 64;
+        uint32_t velSwLayerCount = 0;
+        if (!readVal(stream, velSwCrossfadeEnabled) || !readVal(stream, velSwMainFloor) ||
+            !readVal(stream, velSwLayerCount))
+            return false;
+        d.velSwCrossfadeEnabled = velSwCrossfadeEnabled != 0;
+        d.velSwMainFloor = std::clamp(velSwMainFloor, 1, 126);
+        d.velSwitchLayers.reserve(velSwLayerCount);
+        for (uint32_t li = 0; li < velSwLayerCount; ++li) {
+            VelSwitchLayer layer;
+            int32_t hivel = 64, floor = 64;
+            uint8_t isKitRelative = 0;
+            if (!readString(stream, layer.sourcePath) ||
+                !readString(stream, layer.sampleRelativePath) || !readVal(stream, hivel) ||
+                !readVal(stream, floor) || !readVal(stream, isKitRelative) ||
+                !readString(stream, layer.kitRelativeSubPath))
+                return false;
+            layer.hivel = std::clamp(hivel, 1, 126);
+            layer.floor = std::clamp(floor, 1, 126);
+            layer.isKitRelative = isKitRelative != 0;
+            d.velSwitchLayers.push_back(std::move(layer));
+        }
+
+        // v16: Kit Path (drum's own main source).
+        uint8_t sourceIsKitRelative = 0;
+        if (!readVal(stream, sourceIsKitRelative) || !readString(stream, d.kitRelativeSubPath))
+            return false;
+        d.sourceIsKitRelative = sourceIsKitRelative != 0;
+
         drums.push_back(std::move(d));
     }
 
@@ -1056,6 +1544,12 @@ bool stateLoad(const clap_plugin_t* plugin, const clap_istream_t* stream) {
     int32_t bendUpCents = 2400, bendDownCents = -2400;
     if (!readVal(stream, bendUpCents) || !readVal(stream, bendDownCents)) return false;
 
+    // v17: whole-instrument selectedIndex. Absent from a v16 stream - stays
+    // -1, which the fallback below turns into "select the first drum"
+    // rather than leaving the GUI showing nothing selected.
+    int32_t selectedIndex = -1;
+    if (version >= 17 && !readVal(stream, selectedIndex)) return false;
+
     int nextId = 1;
     for (auto& d : drums) d.id = nextId++;
 
@@ -1063,12 +1557,20 @@ bool stateLoad(const clap_plugin_t* plugin, const clap_istream_t* stream) {
         std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
         p->params.guiState.drums = std::move(drums);
         p->params.guiState.nextId = nextId;
-        p->params.guiState.selectedId = -1;
+        p->params.guiState.selectedId =
+            (selectedIndex >= 0 && selectedIndex < static_cast<int32_t>(p->params.guiState.drums.size()))
+                ? p->params.guiState.drums[static_cast<size_t>(selectedIndex)].id
+                : (p->params.guiState.drums.empty() ? -1 : p->params.guiState.drums.front().id);
         p->params.guiState.listError.clear();
     }
     p->params.mpeEnabled = mpeEnabled != 0;
     p->params.bendUpCents = bendUpCents;
     p->params.bendDownCents = bendDownCents;
+    // Kit Path itself isn't part of this state (see shared.hpp's GuiState::
+    // kitPath) - re-resolve every kit-relative source against whatever THIS
+    // machine currently has configured, in case this state was saved
+    // elsewhere.
+    reresolveStaleSources(p);
     regenerateAndLoadDrumSfz(p);
     return true;
 }
@@ -1099,10 +1601,13 @@ bool guiCreate(const clap_plugin_t* plugin, const char* api, bool is_floating) {
             drawEditorUI(
                 p->params, p->uiState, [p] { regenerateAndLoadDrumSfz(p); },
                 [p](const std::string& path) { loadIntoSelectedDrum(p, path); },
+                [p](const std::string& path) { addVelSwitchLayer(p, path); },
                 [p](const std::string& path) { previewFile(p, path); },
                 [p] { handleSavePreset(p); }, [p] { handleLoadPreset(p); },
                 [p] { handleSaveProfile(p); }, [p] { handleLoadProfile(p); },
-                [p] { explodeSelectedDrumKit(p); }, [p] { initKit(p); });
+                [p] { handleSavePerc(p); }, [p] { handleLoadPerc(p); },
+                [p] { handleSetKitPath(p); },
+                [p](bool addOnTop) { explodeSelectedDrumKit(p, addOnTop); }, [p] { initKit(p); });
         },
         [p](const std::vector<std::string>& paths) {
             // XDND drop: same "load into whatever's selected" as a file
@@ -1205,7 +1710,15 @@ const clap_plugin_gui_t kExtGui = {
 
 // ------------------------------------------------------------------ plugin
 
-bool plugInit(const clap_plugin_t*) { return true; }
+// Loads Kit Path from its own global config file (see kitPathConfigFile
+// above) regardless of whether the GUI ever opens - a host that keeps the
+// editor closed should still resolve kit-relative sources correctly.
+bool plugInit(const clap_plugin_t* plugin) {
+    Plugin* p = self(plugin);
+    std::lock_guard<std::mutex> lock(p->params.guiState.mutex);
+    p->params.guiState.kitPath = loadKitPathFromConfig();
+    return true;
+}
 
 void plugDestroy(const clap_plugin_t* plugin) {
     Plugin* p = self(plugin);

@@ -56,6 +56,45 @@ struct AmpVelCurvePoint {
     float gain = 1.f;   // 0.0..1.0
 };
 
+// VelSW tab: one weaker sample layered under the drum's own main sample by
+// velocity (see editor_ui.cpp's drawVelSwTab). Stored in strict descending-
+// "ceiling" order - index 0 sits immediately below the main/loudest sample.
+// Independent of isSfz/sampleRelativePath: swapping the drum's main sample
+// does NOT clear this (same "instrument design survives a source swap"
+// convention as volume/pan/envelopes/etc below) - only an isSfz source
+// makes the tab unusable, since a velocity switch only makes sense for a
+// single sample.
+//
+// hivel ("ceiling"): 1..126, this layer's own hivel. Without crossfade
+// (DrumItem::velSwCrossfadeEnabled == false) it's also the hard split point
+// - lovel is always derived, never stored: layers[i].lovel = (i+1 < size) ?
+// layers[i+1].hivel+1 : 1, and the main sample's own lovel =
+// layers[0].hivel + 1 (hivel fixed at 127).
+//
+// floor: 1..126, meaningless/unused on the LAST (weakest) layer. Only takes
+// effect when crossfade is enabled: it's this layer's own xfin_lovel/
+// xfout_lovel boundary shared with the layer immediately below it (that
+// layer's own hivel/"ceiling" is the matching xfin_hivel/xfout_hivel for the
+// same zone) - see DrumSfzBuilder.cpp.
+struct VelSwitchLayer {
+    std::string sourcePath;         // absolute, display-only (row tooltip)
+    std::string sampleRelativePath; // root("/")-relative sample=
+    int hivel = 64;                 // 1..126 ("ceiling")
+    int floor = 64;                 // 1..126, crossfade-only, unused on the last layer
+
+    // Kit Path (see SharedParams::GuiState::kitPath/plugin.cpp's
+    // resolveKitRelative): true iff this layer's sample was picked from
+    // inside the configured kit folder. kitRelativeSubPath is the portable,
+    // kit-relative remainder; sourcePath/sampleRelativePath above stay the
+    // real absolute snapshot either way, refreshed against the CURRENT
+    // kitPath by plugin.cpp's reresolveStaleSources whenever that snapshot
+    // might be stale (kit path changed, a file saved on a different
+    // machine was just loaded, or the file was converted to a different
+    // format - see resolveExistingSampleFile's own .flac fallback).
+    bool isKitRelative = false;
+    std::string kitRelativeSubPath;
+};
+
 struct SharedParams {
     // Whole-instrument (not per-drum) MPE toggle, ported from SoloSampler's
     // own SharedParams::mpeEnabled (sibling project) - see
@@ -140,6 +179,21 @@ struct SharedParams {
                                         // drumKitModeEnabled below is set.
         int regionCount = 0;            // isSfz: label-only ("N layers")
 
+        // Kit Path (see GuiState::kitPath/plugin.cpp's resolveKitRelative):
+        // true iff this drum's source was picked from inside the configured
+        // kit folder - auto-detected on every load, regardless of which
+        // file explorer/tab was used to get there. kitRelativeSubPath is
+        // the portable, kit-relative remainder (no leading "/");
+        // sourcePath/sampleRelativePath/regionsText/drumKitGroups above
+        // stay the real absolute snapshot either way - a fallback if Kit
+        // Path is ever unset or the sub-path can't be found under it. See
+        // plugin.cpp's reresolveStaleSources for when that snapshot gets
+        // refreshed against a (possibly different) current kitPath - the
+        // same function also recovers a plain missing file by trying its
+        // .flac sibling, independent of Kit Path (resolveExistingSampleFile).
+        bool sourceIsKitRelative = false;
+        std::string kitRelativeSubPath;
+
         // Sample tab's "Drum Kit Mode": isSfz-only, lets the user pick ONE
         // key/drum out of a whole pre-mapped kit .sfz instead of treating
         // the entire file as a single drum (see DrumKitFlatten.h). Populated
@@ -152,6 +206,20 @@ struct SharedParams {
         bool drumKitModeEnabled = false;
         int drumKitGroupIndex = 0; // index into drumKitGroups, clamped on use
         std::vector<DrumKitKeyGroup> drumKitGroups; // sorted by key ascending
+
+        // VelSW tab: !isSfz drums only (Drum Kit Mode above is the .sfz
+        // equivalent of layering samples). See VelSwitchLayer's own comment
+        // for the lovel/hivel/crossfade derivation - editor_ui.cpp's
+        // drawVelSwTab, plugin.cpp's addVelSwitchLayer, DrumSfzBuilder.cpp.
+        std::vector<VelSwitchLayer> velSwitchLayers;
+        bool velSwCrossfadeEnabled = false; // VelSW tab's "Enable crossfade
+                                            // between velocities" checkbox
+        int velSwMainFloor = 64;    // 1..126, main sample's own crossfade
+                                    // floor (paired with
+                                    // velSwitchLayers[0].hivel) -
+                                    // meaningless unless
+                                    // velSwCrossfadeEnabled and
+                                    // velSwitchLayers is non-empty
 
         // Sample tab (per-drum "instrument design" - independent of which
         // sample/SFZ is loaded, so swapping the source does NOT reset any of
@@ -436,5 +504,18 @@ struct SharedParams {
         // empty - always set together (see plugin.cpp's setListError).
         std::string listError;
         std::chrono::steady_clock::time_point listErrorSetAt{};
+
+        // Kit Path: the user's configured sample-library base folder (see
+        // plugin.cpp's kitPathConfigFile/resolveKitRelative/
+        // reresolveStaleSources). A GLOBAL, cross-project user
+        // preference - loaded once at plugInit from its own small config
+        // file, changed via the persistent row's "Set Kit Folder" button -
+        // deliberately NEVER written into CLAP host state, .drmpreset, or
+        // .drmperc: a saved kit/percussion's own kit-relative sources must
+        // resolve against whatever Kit Path THIS machine has configured,
+        // not a snapshot of wherever it happened to be when saved (that's
+        // the whole point - reinstalling/moving the sample library only
+        // means re-pointing this once, not re-saving every kit).
+        std::string kitPath;
     } guiState;
 };

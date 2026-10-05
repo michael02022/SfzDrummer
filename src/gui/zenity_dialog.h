@@ -21,3 +21,8 @@ std::string zenitySaveFile(const std::string& title, const std::string& defaultP
                            const std::vector<ZenityFilter>& filters);
 std::string zenityOpenFile(const std::string& title, const std::string& defaultPath,
                            const std::vector<ZenityFilter>& filters);
+
+// Folder picker (Kit Path's "Set Kit Folder" button) - same shape/blocking
+// behavior as zenityOpenFile, just directory-only (--directory), no
+// filters (folders don't have file-type filters).
+std::string zenitySelectFolder(const std::string& title, const std::string& defaultPath);

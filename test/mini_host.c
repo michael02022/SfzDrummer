@@ -331,8 +331,38 @@ static void write_custom_opcodes_v12(MemStream* m, const char* label) {
     write_string(m, text);
 }
 
+/* v15 VelSW tab: velSwCrossfadeEnabled, velSwMainFloor, velSwitchLayers
+ * (ver plugin.cpp's stateSave/stateLoad y shared.hpp/DrumSfzBuilder.cpp).
+ * Vacio (0 capas) en las 3 percusiones de este test - VelSW no se ejercita
+ * aca, esto solo prueba que el formato v15 (bump de kStateVersion) sigue
+ * siendo leido correctamente por stateLoad. */
+static void write_velsw_v15(MemStream* m) {
+    clap_ostream_t os = {.ctx = m, .write = mem_write};
+    uint8_t crossfadeEnabled = 0;
+    int32_t mainFloor = 64;
+    uint32_t layerCount = 0;
+    mem_write(&os, &crossfadeEnabled, 1);
+    mem_write(&os, &mainFloor, 4);
+    mem_write(&os, &layerCount, 4);
+}
+
+/* v16 Kit Path: sourceIsKitRelative/kitRelativeSubPath (ver plugin.cpp's
+ * stateSave/stateLoad y shared.hpp) - Kit Path no se ejercita en este
+ * test (isKitRelative=0, sub-path vacio en las 3 percusiones), esto solo
+ * prueba que el formato v16 (bump de kStateVersion) sigue siendo leido
+ * correctamente por stateLoad. La MISMA pareja de campos que este helper
+ * escribe tambien se agrego a cada entrada de velSwitchLayers (write_velsw_v15
+ * arriba sigue escribiendo layerCount=0, asi que esa parte del formato no
+ * se ejercita aca tampoco). */
+static void write_kit_path_v16(MemStream* m) {
+    clap_ostream_t os = {.ctx = m, .write = mem_write};
+    uint8_t isKitRelative = 0;
+    mem_write(&os, &isKitRelative, 1);
+    write_string(m, "");
+}
+
 /* Escribe el mismo formato que plugin.cpp's stateSave/stateLoad (ver
- * kStateMagic/kStateVersion=14): magic, version, count, luego por
+ * kStateMagic/kStateVersion=16): magic, version, count, luego por
  * percusion: rootNote, outputIndex, hasSource, isSfz, label, sourcePath,
  * sampleRelativePath, regionsText, regionCount, drumKitModeEnabled,
  * drumKitGroupIndex, drumKitGroupCount (0 aqui - Drum Kit Mode no se
@@ -341,8 +371,11 @@ static void write_custom_opcodes_v12(MemStream* m, const char* label) {
  * envelope/vel2*, sin ampStartLevel), panRandom/panAlternate (v7), la
  * pestaña Fil completa (v8), la pestaña Pitch completa (v9),
  * pitchVel2Invert (v10), los 3 sliders Decay Time (Extra) (v11),
- * customOpcodesText (v12) y, despues de TODAS las percusiones (no es
- * per-drum), mpeEnabled (v13) y bendUpCents/bendDownCents (v14). */
+ * customOpcodesText (v12), velSwCrossfadeEnabled/velSwMainFloor/
+ * velSwitchLayers (v15, vacio aqui - VelSW no se ejercita en este test),
+ * sourceIsKitRelative/kitRelativeSubPath (v16, Kit Path - tampoco
+ * ejercitado aca) y, despues de TODAS las percusiones (no es per-drum),
+ * mpeEnabled (v13) y bendUpCents/bendDownCents (v14). */
 static void write_drum_no_kit(MemStream* m, int32_t rn, int32_t oi, uint8_t isSfz,
                               const char* label, const char* samplePath, const char* rel) {
     clap_ostream_t os = {.ctx = m, .write = mem_write};
@@ -372,6 +405,8 @@ static void write_drum_no_kit(MemStream* m, int32_t rn, int32_t oi, uint8_t isSf
     write_pitch_invert_v10(m, 0);
     write_decay_extra_v11(m);
     write_custom_opcodes_v12(m, label);
+    write_velsw_v15(m);
+    write_kit_path_v16(m);
 }
 
 /* Percusion en Drum Kit Mode (ver shared.hpp's DrumItem::drumKitGroups):
@@ -430,12 +465,14 @@ static void write_drum_kit_mode(MemStream* m, int32_t rn, int32_t oi, const char
     write_pitch_invert_v10(m, 1);
     write_decay_extra_v11(m);
     write_custom_opcodes_v12(m, label);
+    write_velsw_v15(m);
+    write_kit_path_v16(m);
 }
 
 static void build_state(MemStream* m, const char* samplePath, int rootNoteA, int outIdxA,
                         int rootNoteB, int outIdxB, int rootNoteC, int outIdxC) {
     clap_ostream_t os = {.ctx = m, .write = mem_write};
-    uint32_t magic = 0x44465A53, version = 14, count = 3;
+    uint32_t magic = 0x44465A53, version = 16, count = 3;
     mem_write(&os, &magic, 4);
     mem_write(&os, &version, 4);
     mem_write(&os, &count, 4);
@@ -464,6 +501,28 @@ static void build_state(MemStream* m, const char* samplePath, int rootNoteA, int
     int32_t bendUpCents = 4800, bendDownCents = -4800;
     mem_write(&os, &bendUpCents, 4);
     mem_write(&os, &bendDownCents, 4);
+}
+
+/* True si `path` existe tal cual, o si su hermano con extension .flac
+ * existe en su lugar - refleja el mismo fallback que plugin.cpp's
+ * resolveExistingSampleFile ahora aplica al cargar (Kit Path + FLAC
+ * fallback, para cuando el usuario convierte su libreria a FLAC para
+ * ahorrar espacio). Dejar que el chequeo de mas abajo use esto en vez de
+ * un access() plano permite ejercitar ese fallback real via el mismo
+ * test de audio/routing ya existente - si samplePath se borro dejando
+ * solo su .flac, las aserciones de audio de mas abajo siguen activas en
+ * vez de saltearse silenciosamente. */
+static int sample_path_or_flac_exists(const char* path) {
+    if (access(path, F_OK) == 0) return 1;
+    const char* dot = strrchr(path, '.');
+    const char* slash = strrchr(path, '/');
+    if (!dot || (slash && dot < slash)) return 0; /* sin extension real */
+    char flacPath[4096];
+    size_t baseLen = (size_t)(dot - path);
+    if (baseLen + 6 >= sizeof(flacPath)) return 0;
+    memcpy(flacPath, path, baseLen);
+    memcpy(flacPath + baseLen, ".flac", 6); /* incluye el '\0' final */
+    return access(flacPath, F_OK) == 0;
 }
 
 int main(int argc, char** argv) {
@@ -698,7 +757,7 @@ int main(int argc, char** argv) {
         for (int o = 0; o < NUM_OUTPUTS; ++o)
             printf("  Out %d maxAbs=%.6f\n", o + 1, (double)maxAbs[o]);
 
-        int samplePathExists = access(samplePath, F_OK) == 0;
+        int samplePathExists = sample_path_or_flac_exists(samplePath);
         if (samplePathExists) {
             if (maxAbs[0] <= 1e-4f) {
                 fprintf(stderr, "SILENCIO en Out 1 (Kick) - posible fallo de routing\n");

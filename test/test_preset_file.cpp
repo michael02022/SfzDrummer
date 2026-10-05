@@ -210,6 +210,15 @@ void fillIdentityB(SharedParams::DrumItem& d) {
     d.drumKitGroupIndex = 1;
     d.drumKitGroups = {{10, "<region>\nsample=decoy.wav\n", 1},
                        {20, "<region>\nsample=real.wav\n", 1}};
+    d.velSwCrossfadeEnabled = true;
+    d.velSwMainFloor = 90;
+    d.velSwitchLayers = {
+        {"/home/user/samples/hh_med.wav", "home/user/samples/hh_med.wav", 80, 70, true,
+         "samples/hh_med.wav"},
+        {"/home/user/samples/hh_soft.wav", "home/user/samples/hh_soft.wav", 40, 40, false, ""},
+    };
+    d.sourceIsKitRelative = true;
+    d.kitRelativeSubPath = "kits/full_kit.sfz";
 }
 
 // Compares every design field between two drums - identity fields
@@ -284,7 +293,9 @@ void checkIdentityEqual(const SharedParams::DrumItem& a, const SharedParams::Dru
              a.hasSource == b.hasSource && a.isSfz == b.isSfz && a.sourcePath == b.sourcePath &&
              a.sampleRelativePath == b.sampleRelativePath && a.regionsText == b.regionsText &&
              a.regionCount == b.regionCount && a.drumKitModeEnabled == b.drumKitModeEnabled &&
-             a.drumKitGroupIndex == b.drumKitGroupIndex,
+             a.drumKitGroupIndex == b.drumKitGroupIndex &&
+             a.sourceIsKitRelative == b.sourceIsKitRelative &&
+             a.kitRelativeSubPath == b.kitRelativeSubPath,
          label + ": identity fields match");
 
     bool groupsOk = a.drumKitGroups.size() == b.drumKitGroups.size();
@@ -294,6 +305,23 @@ void checkIdentityEqual(const SharedParams::DrumItem& a, const SharedParams::Dru
                      a.drumKitGroups[i].regionsText == b.drumKitGroups[i].regionsText &&
                      a.drumKitGroups[i].regionCount == b.drumKitGroups[i].regionCount;
     check(groupsOk, label + ": drumKitGroups match");
+
+    check(a.velSwCrossfadeEnabled == b.velSwCrossfadeEnabled &&
+             a.velSwMainFloor == b.velSwMainFloor,
+         label + ": VelSW crossfade/mainFloor match");
+    bool layersOk = a.velSwitchLayers.size() == b.velSwitchLayers.size();
+    if (layersOk)
+        for (size_t i = 0; i < a.velSwitchLayers.size(); ++i)
+            layersOk = layersOk &&
+                     a.velSwitchLayers[i].sourcePath == b.velSwitchLayers[i].sourcePath &&
+                     a.velSwitchLayers[i].sampleRelativePath ==
+                         b.velSwitchLayers[i].sampleRelativePath &&
+                     a.velSwitchLayers[i].hivel == b.velSwitchLayers[i].hivel &&
+                     a.velSwitchLayers[i].floor == b.velSwitchLayers[i].floor &&
+                     a.velSwitchLayers[i].isKitRelative == b.velSwitchLayers[i].isKitRelative &&
+                     a.velSwitchLayers[i].kitRelativeSubPath ==
+                         b.velSwitchLayers[i].kitRelativeSubPath;
+    check(layersOk, label + ": velSwitchLayers match");
 }
 
 // The single most important Profile property: loading one must NEVER
@@ -309,7 +337,11 @@ void checkIdentityIsDefault(const SharedParams::DrumItem& d, const std::string& 
              d.sampleRelativePath == def.sampleRelativePath && d.regionsText == def.regionsText &&
              d.regionCount == def.regionCount &&
              d.drumKitModeEnabled == def.drumKitModeEnabled &&
-             d.drumKitGroupIndex == def.drumKitGroupIndex && d.drumKitGroups.empty(),
+             d.drumKitGroupIndex == def.drumKitGroupIndex && d.drumKitGroups.empty() &&
+             d.velSwCrossfadeEnabled == def.velSwCrossfadeEnabled &&
+             d.velSwMainFloor == def.velSwMainFloor && d.velSwitchLayers.empty() &&
+             d.sourceIsKitRelative == def.sourceIsKitRelative &&
+             d.kitRelativeSubPath == def.kitRelativeSubPath,
          label + ": Profile load carries no leaked identity (all default)");
 }
 
@@ -379,6 +411,23 @@ int main() {
                            "applyDrumProfileDesign target (identity preserved)");
     }
 
+    // --- .drmperc: single drum, FULL identity+design together (unlike
+    // .drmprofile) - so it must round-trip both, including a kit-relative
+    // source and VelSW layers.
+    {
+        SharedParams::DrumItem source;
+        fillIdentityB(source);
+        fillDesignB(source);
+
+        std::string path = (dir / "hihat.drmperc").string();
+        check(writeDrumPerc(path, source), "writeDrumPerc succeeds");
+
+        DrumPercResult result = readDrumPerc(path);
+        check(result.ok, "readDrumPerc succeeds");
+        checkIdentityEqual(result.drum, source, "perc");
+        checkDesignEqual(result.drum, source, "perc");
+    }
+
     // --- Empty-kit preset (0 drums) round-trips cleanly.
     {
         std::string path = (dir / "empty.drmpreset").string();
@@ -399,23 +448,38 @@ int main() {
         DrumProfileResult profileResult = readDrumProfile(path);
         check(!profileResult.ok && !profileResult.error.empty(),
              "readDrumProfile rejects a garbage file cleanly");
+        DrumPercResult percResult = readDrumPerc(path);
+        check(!percResult.ok && !percResult.error.empty(),
+             "readDrumPerc rejects a garbage file cleanly");
     }
 
-    // --- Cross-format rejection: a real .drmpreset file must not be
-    // silently accepted by readDrumProfile (different magic), and vice
-    // versa - each format's own file-type check must actually gate this,
-    // not just happen to fail on field-count mismatches.
+    // --- Cross-format rejection: a real .drmpreset/.drmprofile/.drmperc
+    // file must not be silently accepted by either of the other two
+    // readers (different magic) - each format's own file-type check must
+    // actually gate this, not just happen to fail on field-count
+    // mismatches.
     {
         std::vector<SharedParams::DrumItem> drums(1);
         std::string presetPath = (dir / "real.drmpreset").string();
         writeDrumPreset(presetPath, drums);
-        DrumProfileResult wrongWay = readDrumProfile(presetPath);
-        check(!wrongWay.ok, "readDrumProfile rejects a real .drmpreset file (wrong magic)");
+        check(!readDrumProfile(presetPath).ok,
+             "readDrumProfile rejects a real .drmpreset file (wrong magic)");
+        check(!readDrumPerc(presetPath).ok,
+             "readDrumPerc rejects a real .drmpreset file (wrong magic)");
 
         std::string profilePath = (dir / "real.drmprofile").string();
         writeDrumProfile(profilePath, drums[0]);
-        DrumPresetResult otherWrongWay = readDrumPreset(profilePath);
-        check(!otherWrongWay.ok, "readDrumPreset rejects a real .drmprofile file (wrong magic)");
+        check(!readDrumPreset(profilePath).ok,
+             "readDrumPreset rejects a real .drmprofile file (wrong magic)");
+        check(!readDrumPerc(profilePath).ok,
+             "readDrumPerc rejects a real .drmprofile file (wrong magic)");
+
+        std::string percPath = (dir / "real.drmperc").string();
+        writeDrumPerc(percPath, drums[0]);
+        check(!readDrumPreset(percPath).ok,
+             "readDrumPreset rejects a real .drmperc file (wrong magic)");
+        check(!readDrumProfile(percPath).ok,
+             "readDrumProfile rejects a real .drmperc file (wrong magic)");
     }
 
     std::error_code ec;

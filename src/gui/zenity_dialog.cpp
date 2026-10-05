@@ -87,3 +87,13 @@ std::string zenityOpenFile(const std::string& title, const std::string& defaultP
     appendFilters(args, filters);
     return runZenity(args);
 }
+
+std::string zenitySelectFolder(const std::string& title, const std::string& defaultPath) {
+    std::vector<std::string> args = {
+        "--file-selection",
+        "--directory",
+        "--title=" + title,
+        "--filename=" + defaultPath,
+    };
+    return runZenity(args);
+}

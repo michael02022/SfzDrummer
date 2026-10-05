@@ -16,8 +16,18 @@ class FileExplorer {
 public:
     // Draws the browser filling `size`. onPreview fires on a single click of
     // a sample row (never an .sfz row - preview is sample-only, per spec).
-    // onLoad fires on a double click of a sample OR .sfz row.
-    void draw(const ImVec2& size, const std::function<void(const std::string&)>& onPreview,
+    // onLoad fires on a double click of a sample OR .sfz row. kitPath (Kit
+    // Path, see shared.hpp's GuiState::kitPath), when non-empty, adds a
+    // small "Files"/"Kit" tab pair above the Up/path row - clicking "Kit"
+    // is a one-shot jumpTo(kitPath) navigation shortcut, nothing more
+    // (whether a load ends up kit-relative is decided purely by path
+    // containment in plugin.cpp's resolveKitRelative, not by which tab was
+    // clicked to get there). Hidden entirely when kitPath is empty, so a
+    // user who never sets one sees no UI change. Also doubles as the
+    // very-first-draw starting folder (see initialized_ below) - $HOME is
+    // only the fallback once a Kit Path has been set.
+    void draw(const ImVec2& size, const std::string& kitPath,
+              const std::function<void(const std::string&)>& onPreview,
               const std::function<void(const std::string&)>& onLoad);
 
     // Navigates straight to `dir`, refreshing on the next draw() - used

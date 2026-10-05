@@ -248,8 +248,53 @@ std::string buildDrumSfzText(const std::vector<SharedParams::DrumItem>& drums, i
         writeMasterOpcodes(sfz, d);
         if (d.isSfz) {
             sfz << stripKeyOpcodes(activeRegionsText(d));
-        } else {
+        } else if (d.velSwitchLayers.empty()) {
             sfz << "<region>\n" << "sample=" << d.sampleRelativePath << "\n";
+        } else if (!d.velSwCrossfadeEnabled) {
+            // VelSW, hard switch: main sample covers everything above the
+            // topmost layer's hivel, each layer below covers down to the
+            // next weaker layer's hivel+1 (or 1 for the weakest) - see
+            // shared.hpp's VelSwitchLayer comment.
+            sfz << "<region>\n" << "sample=" << d.sampleRelativePath << "\n"
+                << "lovel=" << (d.velSwitchLayers.front().hivel + 1) << " hivel=127\n";
+            for (size_t i = 0; i < d.velSwitchLayers.size(); ++i) {
+                int lo = (i + 1 < d.velSwitchLayers.size())
+                             ? d.velSwitchLayers[i + 1].hivel + 1
+                             : 1;
+                sfz << "<region>\n" << "sample=" << d.velSwitchLayers[i].sampleRelativePath << "\n"
+                    << "lovel=" << lo << " hivel=" << d.velSwitchLayers[i].hivel << "\n";
+            }
+        } else {
+            // VelSW, crossfade: every pair of adjacent regions (main/
+            // layer[0], layer[i]/layer[i+1]) overlaps between the upper
+            // region's own "floor" and the lower region's own "hivel"/
+            // "ceiling" - see shared.hpp's VelSwitchLayer comment. Every
+            // value is re-clamped here (not just trusted from storage) so a
+            // stale/corrupt lovel>hivel or xfin_lovel>xfin_hivel can never
+            // reach the generated SFZ, same defensive spirit as
+            // activeRegionsText's drumKitGroupIndex clamp above.
+            const auto& layers = d.velSwitchLayers;
+            const size_t n = layers.size();
+            int mainFloor = std::clamp(d.velSwMainFloor, 1, layers[0].hivel);
+            sfz << "<region>\n" << "sample=" << d.sampleRelativePath << "\n"
+                << "lovel=" << mainFloor << " hivel=127\n"
+                << "xfin_lovel=" << mainFloor << " xfin_hivel=" << layers[0].hivel << "\n";
+            for (size_t i = 0; i < n; ++i) {
+                int xfoutLo = (i == 0) ? mainFloor
+                                       : std::min(layers[i - 1].floor, layers[i].hivel);
+                int xfoutHi = layers[i].hivel;
+                sfz << "<region>\n" << "sample=" << layers[i].sampleRelativePath << "\n";
+                if (i + 1 < n) {
+                    int floor = std::clamp(layers[i].floor, 1,
+                                           std::min(layers[i].hivel, layers[i + 1].hivel));
+                    sfz << "lovel=" << floor << " hivel=" << xfoutHi << "\n"
+                        << "xfout_lovel=" << xfoutLo << " xfout_hivel=" << xfoutHi << "\n"
+                        << "xfin_lovel=" << floor << " xfin_hivel=" << layers[i + 1].hivel << "\n";
+                } else {
+                    sfz << "lovel=1 hivel=" << xfoutHi << "\n"
+                        << "xfout_lovel=" << xfoutLo << " xfout_hivel=" << xfoutHi << "\n";
+                }
+            }
         }
     }
     return sfz.str();

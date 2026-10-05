@@ -7,12 +7,23 @@
 namespace {
 
 constexpr uint32_t kDrumPresetMagic = 0x50524d44;  // "DMRP" (sfzDrummer Preset) LE bytes
-constexpr uint32_t kDrumPresetVersion = 1;
+constexpr uint32_t kDrumPresetVersion = 3; // v2: VelSW tab (velSwitchLayers/
+                                           // velSwCrossfadeEnabled/velSwMainFloor,
+                                           // identity-scoped like drumKitGroups)
+                                           // v3: Kit Path (sourceIsKitRelative/
+                                           // kitRelativeSubPath, plus the same pair
+                                           // added to each VelSwitchLayer entry) -
+                                           // NOT the kit path itself, which is a
+                                           // global user preference never part of
+                                           // this format, see shared.hpp's
+                                           // GuiState::kitPath
 constexpr uint32_t kDrumProfileMagic = 0x46524d44; // "DMRF" (sfzDrummer Profile) LE bytes
 constexpr uint32_t kDrumProfileVersion = 1;
-// Deliberately four independent constants (not one shared magic + a "kind"
+constexpr uint32_t kDrumPercMagic = 0x43524d44;    // "DMRC" (sfzDrummer perC) LE bytes
+constexpr uint32_t kDrumPercVersion = 1;
+// Deliberately five independent constants (not one shared magic + a "kind"
 // byte, unlike SoloSampler's .sspreset/.ssprofile) - see PresetFile.h's
-// file comment for why the two sfzdrummer formats don't share a shape.
+// file comment for why the three sfzdrummer formats don't share a shape.
 
 template <typename T>
 bool writeVal(std::ofstream& s, const T& v) {
@@ -256,7 +267,25 @@ bool writeDrumIdentity(std::ofstream& s, const SharedParams::DrumItem& d) {
         if (!ok) break;
         ok = writeVal(s, g.key) && writeStr(s, g.regionsText) && writeVal(s, g.regionCount);
     }
-    return ok;
+    if (!ok) return false;
+
+    // v2: VelSW tab (velocity-switch layers) - identity-scoped, same
+    // category as drumKitGroups above. v3 added isKitRelative/
+    // kitRelativeSubPath to each layer entry's own shape below.
+    ok = writeBool(s, d.velSwCrossfadeEnabled) && writeVal(s, d.velSwMainFloor) &&
+         writeVal(s, static_cast<uint32_t>(d.velSwitchLayers.size()));
+    for (const auto& layer : d.velSwitchLayers) {
+        if (!ok) break;
+        ok = writeStr(s, layer.sourcePath) && writeStr(s, layer.sampleRelativePath) &&
+             writeVal(s, layer.hivel) && writeVal(s, layer.floor) &&
+             writeBool(s, layer.isKitRelative) && writeStr(s, layer.kitRelativeSubPath);
+    }
+    if (!ok) return false;
+
+    // v3: Kit Path (drum's own main source) - NOT the kit path itself,
+    // which is a global user preference, never part of this format (see
+    // shared.hpp's GuiState::kitPath).
+    return writeBool(s, d.sourceIsKitRelative) && writeStr(s, d.kitRelativeSubPath);
 }
 
 bool readDrumIdentity(std::ifstream& s, SharedParams::DrumItem& d) {
@@ -285,6 +314,36 @@ bool readDrumIdentity(std::ifstream& s, SharedParams::DrumItem& d) {
             return false;
         d.drumKitGroups.push_back(std::move(group));
     }
+
+    // v2: VelSW tab.
+    bool velSwCrossfadeEnabled = false;
+    int velSwMainFloor = 64;
+    uint32_t velSwLayerCount = 0;
+    if (!readBool(s, velSwCrossfadeEnabled) || !readVal(s, velSwMainFloor) ||
+        !readVal(s, velSwLayerCount))
+        return false;
+    d.velSwCrossfadeEnabled = velSwCrossfadeEnabled;
+    d.velSwMainFloor = std::clamp(velSwMainFloor, 1, 126);
+    d.velSwitchLayers.clear();
+    d.velSwitchLayers.reserve(velSwLayerCount);
+    for (uint32_t i = 0; i < velSwLayerCount; ++i) {
+        VelSwitchLayer layer;
+        int hivel = 64, floor = 64;
+        bool isKitRelative = false;
+        if (!readStr(s, layer.sourcePath) || !readStr(s, layer.sampleRelativePath) ||
+            !readVal(s, hivel) || !readVal(s, floor) || !readBool(s, isKitRelative) ||
+            !readStr(s, layer.kitRelativeSubPath))
+            return false;
+        layer.hivel = std::clamp(hivel, 1, 126);
+        layer.floor = std::clamp(floor, 1, 126);
+        layer.isKitRelative = isKitRelative;
+        d.velSwitchLayers.push_back(std::move(layer));
+    }
+
+    // v3: Kit Path (drum's own main source).
+    bool sourceIsKitRelative = false;
+    if (!readBool(s, sourceIsKitRelative) || !readStr(s, d.kitRelativeSubPath)) return false;
+    d.sourceIsKitRelative = sourceIsKitRelative;
     return true;
 }
 
@@ -337,6 +396,50 @@ DrumPresetResult readDrumPreset(const std::string& path) {
             return result;
         }
         result.drums.push_back(std::move(d));
+    }
+
+    result.ok = true;
+    return result;
+}
+
+// .drmperc - structurally just one .drmpreset entry (writeDrumIdentity+
+// writeDrumDesign, same order/shape) with its own header instead of a
+// count-prefixed list, since it's always exactly one drum. See
+// PresetFile.h's own comment for why this exists alongside .drmpreset/
+// .drmprofile.
+bool writeDrumPerc(const std::string& path, const SharedParams::DrumItem& drum) {
+    std::ofstream s(path, std::ios::binary | std::ios::trunc);
+    if (!s) return false;
+
+    bool ok = writeVal(s, kDrumPercMagic) && writeVal(s, kDrumPercVersion);
+    if (ok) ok = writeDrumIdentity(s, drum) && writeDrumDesign(s, drum);
+
+    s.flush();
+    return ok && static_cast<bool>(s);
+}
+
+DrumPercResult readDrumPerc(const std::string& path) {
+    DrumPercResult result;
+    std::ifstream s(path, std::ios::binary);
+    if (!s) {
+        result.error = "Could not open file: " + path;
+        return result;
+    }
+
+    uint32_t magic = 0, version = 0;
+    if (!readVal(s, magic) || magic != kDrumPercMagic) {
+        result.error = "Not a sfzdrummer perc file: " + path;
+        return result;
+    }
+    if (!readVal(s, version) || version != kDrumPercVersion) {
+        result.error = "Unsupported perc file version: " + path;
+        return result;
+    }
+
+    if (!readDrumIdentity(s, result.drum) || !readDrumDesign(s, result.drum)) {
+        result.error = "Corrupt or truncated perc file: " + path;
+        result.drum = SharedParams::DrumItem{};
+        return result;
     }
 
     result.ok = true;

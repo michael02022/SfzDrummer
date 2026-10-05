@@ -39,6 +39,24 @@ struct DrumPresetResult {
 // on load, same as plugin.cpp's stateLoad does for CLAP host state).
 DrumPresetResult readDrumPreset(const std::string& path);
 
+// .drmperc - ONE drum's FULL identity+design together (unlike .drmprofile,
+// which deliberately strips identity) - structurally just one .drmpreset
+// entry (writeDrumIdentity+writeDrumDesign) with its own file header, so a
+// fully-designed percussion (source, label, note, output, VelSW layers,
+// AND its instrument design) can be dropped into any other kit. Own magic/
+// version, same "each format gets its own header" rationale as
+// .drmpreset/.drmprofile above.
+bool writeDrumPerc(const std::string& path, const SharedParams::DrumItem& drum);
+
+struct DrumPercResult {
+    bool ok = false;
+    std::string error;
+    SharedParams::DrumItem drum;
+};
+// A successful result's drum has id==0 (the caller assigns a fresh id on
+// load, same convention as .drmpreset's readDrumPreset).
+DrumPercResult readDrumPerc(const std::string& path);
+
 bool writeDrumProfile(const std::string& path, const SharedParams::DrumItem& drum);
 
 struct DrumProfileResult {

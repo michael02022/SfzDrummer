@@ -45,16 +45,40 @@ void FileExplorer::jumpTo(const std::string& dir) {
     needRefresh_ = true;
 }
 
-void FileExplorer::draw(const ImVec2& size, const std::function<void(const std::string&)>& onPreview,
+void FileExplorer::draw(const ImVec2& size, const std::string& kitPath,
+                        const std::function<void(const std::string&)>& onPreview,
                         const std::function<void(const std::string&)>& onLoad) {
+    bool justInitialized = false;
     if (!initialized_) {
         initialized_ = true;
-        const char* home = getenv("HOME");
-        cwd_ = home ? home : "/";
+        justInitialized = true;
+        if (!kitPath.empty()) {
+            cwd_ = kitPath;
+        } else {
+            const char* home = getenv("HOME");
+            cwd_ = home ? home : "/";
+        }
     }
     if (needRefresh_) refresh();
 
     ImGui::BeginChild("##fileexplorer", size, true);
+
+    // Kit Path navigation shortcut - see file_explorer.hpp's draw() comment.
+    // Purely a jumpTo() trigger on the click that lands on "Kit"; nothing
+    // else about this widget's own state depends on which tab is "active" -
+    // except on the very first draw, where "Kit" starts selected (matching
+    // cwd_'s own Kit Path default above) whenever one's already set, so a
+    // user with a Kit Path configured lands on that tab, not "Files".
+    if (!kitPath.empty() && ImGui::BeginTabBar("##fexplorertabs")) {
+        if (ImGui::BeginTabItem("Files")) ImGui::EndTabItem();
+        ImGuiTabItemFlags kitTabFlags =
+            justInitialized ? ImGuiTabItemFlags_SetSelected : 0;
+        if (ImGui::BeginTabItem("Kit", nullptr, kitTabFlags)) {
+            if (ImGui::IsItemClicked()) jumpTo(kitPath);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 
     if (ImGui::Button("Up")) {
         fs::path p(cwd_);
